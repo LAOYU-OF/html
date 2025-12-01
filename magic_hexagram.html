@@ -54,16 +54,23 @@
         const STATE_EXPLODING = 2;   // 正在爆开
         const STATE_HEXAGRAM = 3;    // 六芒星阵
         const STATE_COMPLEX_CIRCLE = 4; // 复杂魔法阵 (图片同款)
+        const STATE_GROUND_CIRCLE = 5; // 3D落地法阵 + 古文字
+        const STATE_BLACK_HOLE = 6;    // 黑洞吞噬
+        const STATE_SUPER_MAGIC = 7;   // 超位魔法阵
+        const STATE_GATHERING = 8;     // 黑洞前置：聚集
 
         let currentState = STATE_SPHERE;
         let animationProgress = 0;
         let time = 0;
         let expansionProgress = 0; // 新增：法阵展开进度
+        let prevHandY = 0; // 用于手势速度检测
 
         // --- Three.js 变量 ---
         let scene, camera, renderer;
         let particleSystem;
-        const PARTICLE_COUNT = 45000; // 增加粒子数以支持更多细节
+        let handGroup; // 手部可视化组
+        const handJointMeshs = []; // 关节Mesh数组
+        const PARTICLE_COUNT = 48000; // 增加粒子数以支持更多细节
         
         // 粒子数据
         const positions = new Float32Array(PARTICLE_COUNT * 3);
@@ -81,6 +88,73 @@
         let handLandmarks = null;
         let pinchDistance = 0; // 两指距离
         let indexFingerX = 0.5; // 食指X坐标 (0-1)
+
+        // --- 漫游交互变量 ---
+        let cursorMesh;
+        let cursorPos = { x: 0, y: 0 };
+        let cursorHeight = 10; // 新增：高度
+        let cameraYaw = 0;     // 新增：水平视角
+        let cameraPitch = 0;   // 新增：垂直视角
+        let isMouseLocked = false; // 新增：鼠标锁定状态
+
+        const cursorKeys = { ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false, Space: false, AltLeft: false, AltRight: false };
+        
+        window.addEventListener('keydown', (e) => {
+            if(cursorKeys.hasOwnProperty(e.code)) cursorKeys[e.code] = true;
+            if(e.code === 'Space') cursorKeys.Space = true;
+            if(e.code === 'AltLeft') cursorKeys.AltLeft = true;
+            if(e.code === 'AltRight') cursorKeys.AltRight = true;
+
+            // T键触发黑洞
+            if (e.key === 't' || e.key === 'T') {
+                if (currentState === STATE_GROUND_CIRCLE || currentState === STATE_SUPER_MAGIC) {
+                    currentState = STATE_GATHERING;
+                    animationProgress = 0;
+                    document.getElementById('status').innerText = "引力坍缩 - 物质聚集";
+                    document.getElementById('status').style.color = "#ff0000";
+                }
+            }
+            
+            // E键触发超位魔法
+            if (e.key === 'e' || e.key === 'E') {
+                if (currentState === STATE_BLACK_HOLE) {
+                    currentState = STATE_SUPER_MAGIC;
+                    generateSuperMagicTargets();
+                    document.getElementById('status').innerText = "超位魔法 - 天空坠落";
+                    document.getElementById('status').style.color = "#00ffff";
+                }
+            }
+
+            if (e.key === 'r' || e.key === 'R') {
+                resetToSphere();
+            }
+        });
+        window.addEventListener('keyup', (e) => {
+            if(cursorKeys.hasOwnProperty(e.code)) cursorKeys[e.code] = false;
+            if(e.code === 'Space') cursorKeys.Space = false;
+            if(e.code === 'AltLeft') cursorKeys.AltLeft = false;
+            if(e.code === 'AltRight') cursorKeys.AltRight = false;
+        });
+
+        // 鼠标控制视角
+        document.addEventListener('click', () => {
+            if (currentState >= STATE_GROUND_CIRCLE) {
+                document.body.requestPointerLock();
+            }
+        });
+
+        document.addEventListener('pointerlockchange', () => {
+            isMouseLocked = document.pointerLockElement === document.body;
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (isMouseLocked) {
+                cameraYaw -= e.movementX * 0.002;
+                cameraPitch -= e.movementY * 0.002;
+                // 限制垂直视角，防止翻转
+                cameraPitch = Math.max(-Math.PI/2 + 0.1, Math.min(Math.PI/2 - 0.1, cameraPitch));
+            }
+        });
 
         // --- 初始化 Three.js ---
         function initThree() {
@@ -146,6 +220,27 @@
             particleSystem = new THREE.Points(geometry, material);
             scene.add(particleSystem);
 
+            // --- 漫游光标 (Cursor) ---
+            const cursorGeo = new THREE.SphereGeometry(4, 16, 16);
+            const cursorMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.8 });
+            cursorMesh = new THREE.Mesh(cursorGeo, cursorMat);
+            cursorMesh.visible = false;
+            scene.add(cursorMesh); // 添加到场景根节点，独立于粒子系统旋转
+
+            // --- 初始化手部可视化 (关节) ---
+            handGroup = new THREE.Group();
+            scene.add(handGroup);
+            const jointGeo = new THREE.SphereGeometry(8, 16, 16); // 关节球体
+            const jointMat = new THREE.MeshBasicMaterial({ color: 0x00ffff, transparent: true, opacity: 0.6 }); // 青色半透明
+            
+            // 预创建 2只手 * 21个关节 = 42个
+            for (let i = 0; i < 42; i++) {
+                const mesh = new THREE.Mesh(jointGeo, jointMat);
+                mesh.visible = false;
+                handGroup.add(mesh);
+                handJointMeshs.push(mesh);
+            }
+
             window.addEventListener('resize', onWindowResize);
         }
 
@@ -156,6 +251,81 @@
         }
 
         // --- 目标生成 ---
+        
+        // 新增：生成宇宙环境 (星空 + 天体)
+        function generateUniverse(startIdx = 30000) {
+            // 1. 背景星空 (startIdx ~ startIdx + 8000)
+            const starEnd = startIdx + 8000;
+            for (let i = startIdx; i < starEnd; i++) {
+                if (i >= PARTICLE_COUNT) break;
+                const r = 1500 + Math.random() * 2500; // 远景
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+
+                targetPositions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+                targetPositions[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+                targetPositions[i * 3 + 2] = r * Math.cos(phi);
+            }
+
+            // 2. 悬浮天体/星云粒子 (starEnd ~ starEnd + 4000)
+            // 生成 3 个小行星球体
+            let idx = starEnd;
+            const planetCount = 3;
+            for(let p=0; p<planetCount; p++) {
+                // 随机行星位置 (环绕在法阵周围)
+                const planetR = 600 + Math.random() * 400;
+                const planetTheta = Math.random() * Math.PI * 2;
+                const planetPhi = Math.PI * (0.2 + Math.random() * 0.6); // 避免太靠近极点
+                
+                const cx = planetR * Math.sin(planetPhi) * Math.cos(planetTheta);
+                const cy = planetR * Math.sin(planetPhi) * Math.sin(planetTheta);
+                const cz = planetR * Math.cos(planetPhi);
+                
+                const radius = 40 + Math.random() * 30;
+                const particlesForPlanet = 800;
+                
+                for(let k=0; k<particlesForPlanet; k++) {
+                    if(idx >= PARTICLE_COUNT) break;
+                    // 球体分布
+                    const pr = radius * Math.cbrt(Math.random());
+                    const pt = Math.random() * Math.PI * 2;
+                    const pp = Math.acos(2 * Math.random() - 1);
+                    
+                    targetPositions[idx*3] = cx + pr * Math.sin(pp) * Math.cos(pt);
+                    targetPositions[idx*3+1] = cy + pr * Math.sin(pp) * Math.sin(pt);
+                    targetPositions[idx*3+2] = cz + pr * Math.cos(pp);
+                    
+                    // 存储行星ID到 randoms 属性，用于着色
+                    randoms[idx*3] = p + 1; 
+                    idx++;
+                }
+            }
+            
+            // 剩余的做成漂浮的星尘带 -> 填充整个球型空间
+            while(idx < PARTICLE_COUNT) {
+                // 使用球坐标均匀分布，填满整个空间 (半径4000)
+                const r = Math.random() * 4000; 
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                
+                targetPositions[idx*3] = r * Math.sin(phi) * Math.cos(theta);
+                targetPositions[idx*3+1] = r * Math.sin(phi) * Math.sin(theta);
+                targetPositions[idx*3+2] = r * Math.cos(phi);
+                randoms[idx*3] = 0; // 0 代表星尘
+                idx++;
+            }
+
+            // 3. 红色边界球 (42000 - 45000)
+            const sphereR = 4000;
+            for (let i = 42000; i < 45000; i++) {
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                
+                targetPositions[i * 3] = sphereR * Math.sin(phi) * Math.cos(theta);
+                targetPositions[i * 3 + 1] = sphereR * Math.sin(phi) * Math.sin(theta);
+                targetPositions[i * 3 + 2] = sphereR * Math.cos(phi);
+            }
+        }
 
         function generateHexagramTargets() {
             const r = 400; 
@@ -223,6 +393,286 @@
                 targetPositions[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
                 targetPositions[i * 3 + 2] = r * Math.cos(phi);
             }
+        }
+
+        function generateBlackHoleTargets() {
+            // 黑洞参数
+            const eventHorizon = 50; // 事件视界半径
+            const accretionDiskInner = 60;
+            const accretionDiskOuter = 600;
+            
+            let idx = 0;
+            
+            // 1. 吸积盘 (Accretion Disk) - 高密度
+            // 粒子数: 35000
+            while(idx < 35000) {
+                // 分布：越靠近中心越密集
+                // r = inner + (outer - inner) * (random^power)
+                const t = Math.random();
+                const r = accretionDiskInner + (accretionDiskOuter - accretionDiskInner) * (t * t); 
+                const theta = Math.random() * Math.PI * 2;
+                
+                // 盘面厚度随半径增加
+                const thickness = 2 + (r / accretionDiskOuter) * 20;
+                const z = (Math.random() - 0.5) * thickness;
+                
+                targetPositions[idx * 3] = r * Math.cos(theta);
+                targetPositions[idx * 3 + 1] = r * Math.sin(theta);
+                targetPositions[idx * 3 + 2] = z;
+                
+                // 存储初始角度和半径到 randoms，用于动画计算
+                randoms[idx * 3] = theta;     // 初始角度
+                randoms[idx * 3 + 1] = r;     // 初始半径
+                randoms[idx * 3 + 2] = Math.random(); // 随机速度因子
+                
+                // 恢复正常大小
+                sizes[idx] = Math.random() * 3 + 1;
+                idx++;
+            }
+            
+            // 2. (已移除) 相对论喷流
+            // 原喷流逻辑已删除，粒子将用于光晕
+
+            // 3. 剩余粒子：引力透镜光晕 (Gravitational Lensing Halo)
+            while(idx < PARTICLE_COUNT) {
+                const r = accretionDiskOuter + Math.random() * 400;
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                
+                targetPositions[idx * 3] = r * Math.sin(phi) * Math.cos(theta);
+                targetPositions[idx * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+                targetPositions[idx * 3 + 2] = r * Math.cos(phi);
+                randoms[idx * 3] = -1; // 标记为光晕
+                
+                sizes[idx] = Math.random() * 3 + 1;
+                idx++;
+            }
+            
+            // 更新大小属性
+            particleSystem.geometry.attributes.size.needsUpdate = true;
+        }
+
+        function generateSuperMagicTargets() {
+            let idx = 0;
+            const R_BASE = 600; 
+            const MAGIC_PARTICLE_LIMIT = 35000; // 前35000个用于魔法阵
+
+            // 辅助：画圆 (支持圆心偏移)
+            function addCircle(cx, cy, r, z, count) {
+                for(let i=0; i<count; i++) {
+                    if(idx >= MAGIC_PARTICLE_LIMIT) return;
+                    const theta = Math.random() * Math.PI * 2;
+                    targetPositions[idx*3] = cx + r * Math.cos(theta);
+                    targetPositions[idx*3+1] = cy + r * Math.sin(theta);
+                    targetPositions[idx*3+2] = z;
+                    idx++;
+                }
+            }
+            
+            // 辅助：画多边形
+            function addPoly(cx, cy, z, r, sides, count, rotOffset=0) {
+                const points = [];
+                for(let i=0; i<sides; i++) {
+                    const angle = (i * 360 / sides + rotOffset) * Math.PI / 180;
+                    points.push({x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle)});
+                }
+                const particlesPerLine = Math.floor(count / sides);
+                for(let i=0; i<sides; i++) {
+                    const p1 = points[i];
+                    const p2 = points[(i+1)%sides];
+                    for(let k=0; k<particlesPerLine; k++) {
+                        if(idx >= MAGIC_PARTICLE_LIMIT) return;
+                        const t = k/particlesPerLine;
+                        targetPositions[idx*3] = p1.x + (p2.x-p1.x)*t;
+                        targetPositions[idx*3+1] = p1.y + (p2.y-p1.y)*t;
+                        targetPositions[idx*3+2] = z;
+                        idx++;
+                    }
+                }
+            }
+
+            // 辅助：生成古文字环 (Rune Ring)
+            function addRuneRing(radius, z, charCount, particlesPerChar) {
+                const charSize = (radius * 2 * Math.PI / charCount) * 0.6;
+                for(let i=0; i<charCount; i++) {
+                    const angle = (i * 360 / charCount) * Math.PI / 180;
+                    const cx = radius * Math.cos(angle);
+                    const cy = radius * Math.sin(angle);
+                    
+                    // 切向向量
+                    const tx = -Math.sin(angle);
+                    const ty = Math.cos(angle);
+                    // 径向向量
+                    const rx = Math.cos(angle);
+                    const ry = Math.sin(angle);
+
+                    // 生成一个随机符文 (3-4笔画)
+                    const strokes = 3 + Math.floor(Math.random() * 2);
+                    const ptsPerStroke = Math.floor(particlesPerChar / strokes);
+                    
+                    for(let s=0; s<strokes; s++) {
+                        const u1 = (Math.random()-0.5) * charSize;
+                        const v1 = (Math.random()-0.5) * charSize;
+                        const u2 = (Math.random()-0.5) * charSize;
+                        const v2 = (Math.random()-0.5) * charSize;
+                        
+                        const p1x = cx + u1 * tx + v1 * rx;
+                        const p1y = cy + u1 * ty + v1 * ry;
+                        const p1z = z;
+                        
+                        const p2x = cx + u2 * tx + v2 * rx;
+                        const p2y = cy + u2 * ty + v2 * ry;
+                        const p2z = z;
+                        
+                        for(let k=0; k<ptsPerStroke; k++) {
+                            if(idx >= MAGIC_PARTICLE_LIMIT) return;
+                            const t = k/ptsPerStroke;
+                            targetPositions[idx*3] = p1x + (p2x-p1x)*t;
+                            targetPositions[idx*3+1] = p1y + (p2y-p1y)*t;
+                            targetPositions[idx*3+2] = p1z;
+                            idx++;
+                        }
+                    }
+                }
+            }
+
+            // --- 1. 底部超大魔法阵 (Base) - 精致版 ---
+            
+            // A. 外围刻度圈 (Outer Scale)
+            addCircle(0, 0, R_BASE, 0, 1500);
+            addCircle(0, 0, R_BASE * 0.98, 0, 1000);
+            // 刻度线
+            for(let i=0; i<72; i++) {
+                const angle = (i * 5) * Math.PI / 180;
+                const x1 = R_BASE * Math.cos(angle);
+                const y1 = R_BASE * Math.sin(angle);
+                const x2 = R_BASE * 0.92 * Math.cos(angle);
+                const y2 = R_BASE * 0.92 * Math.sin(angle);
+                for(let k=0; k<10; k++) {
+                     if(idx >= MAGIC_PARTICLE_LIMIT) break;
+                     const t = k/10;
+                     targetPositions[idx*3] = x1 + (x2-x1)*t;
+                     targetPositions[idx*3+1] = y1 + (y2-y1)*t;
+                     targetPositions[idx*3+2] = 0;
+                     idx++;
+                }
+            }
+
+            // B. 外圈符文带 (Outer Runes)
+            addRuneRing(R_BASE * 0.88, 0, 48, 50); 
+            addCircle(0, 0, R_BASE * 0.82, 0, 800);
+
+            // C. 几何结构层 (Geometry Layer)
+            // 12芒星 (Dodecagram)
+            addPoly(0, 0, 0, R_BASE * 0.82, 12, 1500); 
+            
+            // 在12芒星的每个顶点添加装饰小圆
+            for(let i=0; i<12; i++) {
+                const angle = (i * 30) * Math.PI / 180;
+                const cx = R_BASE * 0.82 * Math.cos(angle);
+                const cy = R_BASE * 0.82 * Math.sin(angle);
+                addCircle(cx, cy, 25, 0, 60); 
+            }
+
+            // D. 中间层 (Middle Layer)
+            addCircle(0, 0, R_BASE * 0.6, 0, 800);
+            // 内部符文带
+            addRuneRing(R_BASE * 0.55, 0, 24, 40);
+            addCircle(0, 0, R_BASE * 0.5, 0, 600);
+            
+            // 交错六芒星 (Interlaced Hexagrams)
+            addPoly(0, 0, 0, R_BASE * 0.5, 6, 800);
+            addPoly(0, 0, 0, R_BASE * 0.5, 6, 800, 30);
+            
+            // 填充纹理：螺旋线 (Spirals)
+            const spiralCount = 6;
+            for(let i=0; i<spiralCount; i++) {
+                const startAngle = (i * 60) * Math.PI / 180;
+                for(let k=0; k<100; k++) {
+                    if(idx >= MAGIC_PARTICLE_LIMIT) break;
+                    const t = k/100; // 0-1
+                    const r = R_BASE * 0.2 + t * (R_BASE * 0.3); // 0.2 -> 0.5
+                    const theta = startAngle + t * 2.0; // 旋转
+                    targetPositions[idx*3] = r * Math.cos(theta);
+                    targetPositions[idx*3+1] = r * Math.sin(theta);
+                    targetPositions[idx*3+2] = 0;
+                    idx++;
+                }
+            }
+
+            // E. 核心层 (Core)
+            addCircle(0, 0, R_BASE * 0.2, 0, 500);
+            // 核心三角
+            addPoly(0, 0, 0, R_BASE * 0.2, 3, 300);
+            addPoly(0, 0, 0, R_BASE * 0.2, 3, 300, 60);
+            // 核心能量点
+            addCircle(0, 0, R_BASE * 0.05, 0, 200);
+
+            // --- 2. 穹顶光环 (Dome Rings) ---
+            const domeLayers = 6;
+            for(let i=1; i<=domeLayers; i++) {
+                const phi = (i / (domeLayers+1)) * (Math.PI / 2); 
+                const r = R_BASE * Math.cos(phi);
+                const z = R_BASE * Math.sin(phi);
+                
+                addCircle(0, 0, r, z, 600);
+                // 装饰节点
+                if (i % 2 !== 0) {
+                    const nodes = 6;
+                    for(let n=0; n<nodes; n++) {
+                        const ang = (n * 360 / nodes) * Math.PI / 180;
+                        const nx = r * Math.cos(ang);
+                        const ny = r * Math.sin(ang);
+                        // 小光球
+                        for(let p=0; p<50; p++) {
+                            if(idx >= MAGIC_PARTICLE_LIMIT) break;
+                            targetPositions[idx*3] = nx + (Math.random()-0.5)*10;
+                            targetPositions[idx*3+1] = ny + (Math.random()-0.5)*10;
+                            targetPositions[idx*3+2] = z + (Math.random()-0.5)*10;
+                            idx++;
+                        }
+                    }
+                }
+            }
+
+            // --- 3. 表面卫星法阵 (Satellite Circles) ---
+            const satelliteCount = 4;
+            for(let i=0; i<satelliteCount; i++) {
+                const theta = (i / satelliteCount) * Math.PI * 2;
+                const phi = Math.PI / 3; 
+                
+                const r_sphere = R_BASE;
+                const cx = r_sphere * Math.cos(phi) * Math.cos(theta);
+                const cy = r_sphere * Math.cos(phi) * Math.sin(theta);
+                const cz = r_sphere * Math.sin(phi);
+                
+                addCircle(cx, cy, 40, cz, 300); 
+                // 卫星符文
+                for(let k=0; k<200; k++) {
+                     if(idx >= MAGIC_PARTICLE_LIMIT) break;
+                     const ang = Math.random() * Math.PI * 2;
+                     const rad = 30 + Math.random() * 5;
+                     targetPositions[idx*3] = cx + rad * Math.cos(ang); 
+                     targetPositions[idx*3+1] = cy + rad * Math.sin(ang);
+                     targetPositions[idx*3+2] = cz;
+                     idx++;
+                }
+            }
+
+            // --- 4. 中央光柱 (Central Beam) ---
+            while(idx < MAGIC_PARTICLE_LIMIT) {
+                const h = Math.random() * R_BASE * 1.2;
+                const r = Math.random() * 30 * (1 - h/(R_BASE*1.2)); // 锥形光柱
+                const theta = Math.random() * Math.PI * 2;
+                
+                targetPositions[idx*3] = r * Math.cos(theta);
+                targetPositions[idx*3+1] = r * Math.sin(theta);
+                targetPositions[idx*3+2] = h;
+                idx++;
+            }
+            
+            // --- 5. 重新生成宇宙背景 ---
+            generateUniverse(MAGIC_PARTICLE_LIMIT);
         }
 
         // 生成复杂魔法阵 (参照图片)
@@ -425,6 +875,14 @@
             currentState = STATE_SPHERE;
             particleSystem.rotation.set(0, 0, 0);
             particleSystem.scale.setScalar(1.0);
+            camera.position.set(0, 0, 800); // 重置相机位置
+            camera.rotation.set(0, 0, 0); // 重置相机旋转
+            
+            // 重置漫游变量
+            cursorPos = { x: 0, y: 0 };
+            cursorHeight = 10;
+            cameraYaw = 0;
+            cameraPitch = 0;
             
             const color = new THREE.Color();
             
@@ -449,11 +907,7 @@
             document.getElementById('status').style.color = "#00ff00";
         }
 
-        window.addEventListener('keydown', (e) => {
-            if (e.key === 'r' || e.key === 'R') {
-                resetToSphere();
-            }
-        });
+        // (已合并到上方 keydown 监听器)
 
         // --- 动画循环 ---
         function animate() {
@@ -726,6 +1180,569 @@
 
                 // 整体旋转
                 particleSystem.rotation.z -= 0.002; // 反向慢速旋转
+
+            } else if (currentState === STATE_GROUND_CIRCLE) {
+                // --- 3D 落地法阵状态 ---
+                
+                // 0. 键盘漫游控制 (FPS 模式)
+                const moveSpeed = 2.5; 
+                
+                // 计算移动方向 (相对于摄像机 Yaw)
+                // 摄像机看向 -Z (Yaw=0时)
+                // Forward: x = -sin(yaw), z = -cos(yaw)
+                // Right:   x = cos(yaw),  z = -sin(yaw)
+                
+                const sinYaw = Math.sin(cameraYaw);
+                const cosYaw = Math.cos(cameraYaw);
+                
+                if (cursorKeys.ArrowUp) {
+                    cursorPos.x -= sinYaw * moveSpeed;
+                    cursorPos.y -= cosYaw * moveSpeed; // y 存储 Z
+                }
+                if (cursorKeys.ArrowDown) {
+                    cursorPos.x += sinYaw * moveSpeed;
+                    cursorPos.y += cosYaw * moveSpeed;
+                }
+                if (cursorKeys.ArrowLeft) {
+                    cursorPos.x -= cosYaw * moveSpeed;
+                    cursorPos.y += sinYaw * moveSpeed;
+                }
+                if (cursorKeys.ArrowRight) {
+                    cursorPos.x += cosYaw * moveSpeed;
+                    cursorPos.y -= sinYaw * moveSpeed;
+                }
+                
+                // 高度控制
+                if (cursorKeys.Space) cursorHeight += moveSpeed;
+                if (cursorKeys.AltLeft || cursorKeys.AltRight) cursorHeight -= moveSpeed;
+
+                // 计算物理交互点 (World -> Local)
+                const localCursor = new THREE.Vector3(cursorPos.x, cursorHeight, cursorPos.y);
+                
+                if (cursorMesh) {
+                    cursorMesh.visible = false; 
+                    cursorMesh.position.copy(localCursor); 
+                    
+                    // --- 第一人称相机跟随 ---
+                    // 相机位置直接等于光标位置 (眼睛位置)
+                    // 稍微平滑一点
+                    camera.position.x += (cursorPos.x - camera.position.x) * 0.2;
+                    camera.position.y += (cursorHeight + 20 - camera.position.y) * 0.2; // +20 眼睛高度
+                    camera.position.z += (cursorPos.y - camera.position.z) * 0.2;
+                    
+                    // 相机旋转 (Yaw/Pitch)
+                    // 使用 Quaternion 或 Euler
+                    camera.rotation.order = 'YXZ';
+                    camera.rotation.y = cameraYaw;
+                    camera.rotation.x = cameraPitch;
+                    
+                    // 转换坐标用于物理计算
+                    particleSystem.worldToLocal(localCursor);
+                }
+
+                // 1. 姿态倾斜动画 (从竖直 -> 平躺)
+                // 目标: rotation.x = -Math.PI / 2 (完全平躺)
+                const targetTilt = -Math.PI / 2;
+                particleSystem.rotation.x += (targetTilt - particleSystem.rotation.x) * 0.05;
+                particleSystem.rotation.z -= 0.0005; // 减慢自转速度 (原 0.002)
+
+                // 2. 保持法阵形状 (复用 ComplexCircle 的逻辑，但强制展开)
+                const maxRadius = 500;
+                // 强制 expansionProgress 为 1.0
+                expansionProgress += (1.0 - expansionProgress) * 0.1;
+                
+                // (已移除手势触发黑洞逻辑，改为按 T 键)
+
+                // 3. 随机古文字效果 (Floating Runes)
+                // 占用最后 3000 个粒子作为动态文字
+                const runeStartIndex = PARTICLE_COUNT - 3000;
+                // 星空粒子范围
+                const starStartIndex = 30000;
+                const starEndIndex = 38000;
+                // 天体粒子范围
+                const celestialStartIndex = 38000;
+                const celestialEndIndex = 42000;
+                // 红色边界球范围
+                const redSphereStartIndex = 42000;
+                const redSphereEndIndex = 45000;
+                
+                for (let i = 0; i < PARTICLE_COUNT; i++) {
+                    // 红色边界球处理
+                    if (i >= redSphereStartIndex && i < redSphereEndIndex) {
+                        const tx = targetPositions[i * 3];
+                        const ty = targetPositions[i * 3 + 1];
+                        const tz = targetPositions[i * 3 + 2];
+                        
+                        // 缓慢旋转
+                        const rotSpeed = 0.0002;
+                        const rotX = tx * Math.cos(time * rotSpeed) - tz * Math.sin(time * rotSpeed);
+                        const rotZ = tx * Math.sin(time * rotSpeed) + tz * Math.cos(time * rotSpeed);
+                        
+                        currentPositions[i * 3] += (rotX - currentPositions[i * 3]) * 0.1;
+                        currentPositions[i * 3 + 1] += (ty - currentPositions[i * 3 + 1]) * 0.1;
+                        currentPositions[i * 3 + 2] += (rotZ - currentPositions[i * 3 + 2]) * 0.1;
+                        
+                        // 红色呼吸效果
+                        const pulse = 0.5 + 0.5 * Math.sin(time * 3 + i * 0.01);
+                        currentColors[i * 3] = 1.0 * pulse;
+                        currentColors[i * 3 + 1] = 0.0;
+                        currentColors[i * 3 + 2] = 0.0;
+                        continue;
+                    }
+
+                    // 星空粒子处理
+                    if (i >= starStartIndex && i < starEndIndex) {
+                        // 移动到星空位置
+                        const tx = targetPositions[i * 3];
+                        const ty = targetPositions[i * 3 + 1];
+                        const tz = targetPositions[i * 3 + 2];
+                        
+                        currentPositions[i * 3] += (tx - currentPositions[i * 3]) * 0.05;
+                        currentPositions[i * 3 + 1] += (ty - currentPositions[i * 3 + 1]) * 0.05;
+                        currentPositions[i * 3 + 2] += (tz - currentPositions[i * 3 + 2]) * 0.05;
+                        
+                        // 闪烁效果
+                        const flicker = Math.random() > 0.95 ? 1.0 : 0.8;
+                        currentColors[i * 3] = flicker;
+                        currentColors[i * 3 + 1] = flicker;
+                        currentColors[i * 3 + 2] = flicker;
+                        continue; 
+                    }
+
+                    // 天体粒子处理
+                    if (i >= celestialStartIndex && i < celestialEndIndex) {
+                        const tx = targetPositions[i * 3];
+                        const ty = targetPositions[i * 3 + 1];
+                        const tz = targetPositions[i * 3 + 2];
+                        
+                        // 缓慢公转 (绕Z轴)
+                        // 法阵转速是 -0.0005 (顺时针)
+                        // 我们希望天体转得更慢，比如 -0.0002
+                        // 所以需要相对于法阵逆时针转 +0.0003
+                        const relativeSpeed = 0.0003;
+                        
+                        // 重新计算旋转后的目标
+                        const rotX = tx * Math.cos(time * relativeSpeed) - ty * Math.sin(time * relativeSpeed);
+                        const rotY = tx * Math.sin(time * relativeSpeed) + ty * Math.cos(time * relativeSpeed);
+                        
+                        currentPositions[i * 3] += (rotX - currentPositions[i * 3]) * 0.05;
+                        currentPositions[i * 3 + 1] += (rotY - currentPositions[i * 3 + 1]) * 0.05;
+                        currentPositions[i * 3 + 2] += (tz - currentPositions[i * 3 + 2]) * 0.05;
+
+                        // 颜色
+                        const type = randoms[i * 3]; // 0:星尘, 1/2/3:行星
+                        if (type > 0) {
+                            // 行星颜色 (红/绿/蓝)
+                            if (type === 1) { currentColors[i*3]=1.0; currentColors[i*3+1]=0.2; currentColors[i*3+2]=0.2; }
+                            else if (type === 2) { currentColors[i*3]=0.2; currentColors[i*3+1]=1.0; currentColors[i*3+2]=0.2; }
+                            else { currentColors[i*3]=0.2; currentColors[i*3+1]=0.4; currentColors[i*3+2]=1.0; }
+                        } else {
+                            // 星尘 (淡紫)
+                            currentColors[i*3] = 0.6;
+                            currentColors[i*3+1] = 0.4;
+                            currentColors[i*3+2] = 0.8;
+                        }
+                        
+                        // 物理反馈 (同样适用)
+                        const dx = currentPositions[i*3] - localCursor.x;
+                        const dy = currentPositions[i*3+1] - localCursor.y;
+                        const dz = currentPositions[i*3+2] - localCursor.z; // 3D距离
+                        const distSq = dx*dx + dy*dy + dz*dz;
+                        const interactRadius = 80;
+                        
+                        if (distSq < interactRadius * interactRadius) {
+                            const dist = Math.sqrt(distSq);
+                            const force = (interactRadius - dist) / interactRadius;
+                            const pushStrength = 20 * force;
+                            
+                            currentPositions[i*3] += (dx/dist) * pushStrength;
+                            currentPositions[i*3+1] += (dy/dist) * pushStrength;
+                            currentPositions[i*3+2] += (dz/dist) * pushStrength;
+                        }
+                        continue;
+                    }
+
+                    if (i < runeStartIndex) {
+                        // --- 主法阵粒子 (保持原样) ---
+                        const tx = targetPositions[i * 3];
+                        const ty = targetPositions[i * 3 + 1];
+                        const tz = targetPositions[i * 3 + 2];
+                        
+                        // 直接移动到位
+                        currentPositions[i * 3] += (tx - currentPositions[i * 3]) * 0.1;
+                        currentPositions[i * 3 + 1] += (ty - currentPositions[i * 3 + 1]) * 0.1;
+                        currentPositions[i * 3 + 2] += (tz - currentPositions[i * 3 + 2]) * 0.1;
+
+                        // 颜色：金色/青色流光
+                        const px = currentPositions[i * 3];
+                        const py = currentPositions[i * 3 + 1];
+                        const dist = Math.sqrt(px*px + py*py);
+                        const angle = Math.atan2(py, px);
+                        
+                        const wave = Math.sin(angle * 5 + dist * 0.01 - time * 0.1);
+                        const hue = 0.6 + 0.1 * wave; // 青紫
+                        const lightness = 0.6 + 0.3 * Math.sin(dist * 0.02 - time * 0.1);
+                        
+                        const tempColor = new THREE.Color().setHSL(hue, 1.0, lightness);
+                        currentColors[i * 3] += (tempColor.r - currentColors[i * 3]) * 0.1;
+                        currentColors[i * 3 + 1] += (tempColor.g - currentColors[i * 3 + 1]) * 0.1;
+                        currentColors[i * 3 + 2] += (tempColor.b - currentColors[i * 3 + 2]) * 0.1;
+
+                    } else {
+                        // --- 随机古文字粒子 (Structured Runes) ---
+                        // 将粒子分组，每组构成一个符文
+                        const particlesPerRune = 50;
+                        const relativeI = i - runeStartIndex;
+                        const runeId = Math.floor(relativeI / particlesPerRune);
+                        const offset = relativeI % particlesPerRune;
+                        const leaderIdx = runeStartIndex + runeId * particlesPerRune;
+                        
+                        // 使用组长粒子的 randoms 属性存储生命周期
+                        let life = randoms[leaderIdx * 3];
+                        
+                        // 仅由组长负责重置/生成形状数据
+                        if (offset === 0) {
+                            if (life <= 0) {
+                                // 尝试重生
+                                if (Math.random() < 0.01) { 
+                                    life = 1.0;
+                                    randoms[leaderIdx * 3] = life;
+                                    
+                                    // 生成符文形状数据并存入 targetPositions
+                                    const r = 200 + Math.random() * 250;
+                                    const theta = Math.random() * Math.PI * 2;
+                                    const cx = r * Math.cos(theta);
+                                    const cy = r * Math.sin(theta);
+                                    const charSize = 30;
+                                    
+                                    // 计算切向向量 (让文字"站立"并面向圆心)
+                                    const tx = -Math.sin(theta); // 切向 X
+                                    const ty = Math.cos(theta);  // 切向 Y
+                                    
+                                    // 生成 3-4 笔画
+                                    const strokes = 3 + Math.floor(Math.random() * 2);
+                                    const ptsPerStroke = Math.floor(particlesPerRune / strokes);
+                                    let pCount = 0;
+                                    
+                                    for(let s=0; s<strokes; s++) {
+                                        // 在局部坐标系生成线段 (u:水平切向, v:垂直Z轴)
+                                        const u1 = (Math.random()-0.5) * charSize;
+                                        const v1 = Math.random() * charSize; 
+                                        const u2 = (Math.random()-0.5) * charSize;
+                                        const v2 = Math.random() * charSize;
+                                        
+                                        // 转换到世界坐标 (相对于 cx, cy)
+                                        const p1x = cx + u1 * tx;
+                                        const p1y = cy + u1 * ty;
+                                        const p1z = v1;
+                                        
+                                        const p2x = cx + u2 * tx;
+                                        const p2y = cy + u2 * ty;
+                                        const p2z = v2;
+                                        
+                                        for(let k=0; k<ptsPerStroke; k++) {
+                                            if (pCount >= particlesPerRune) break;
+                                            const t = k / ptsPerStroke;
+                                            const pIdx = leaderIdx + pCount;
+                                            
+                                            // 存入 targetPositions (作为形状模板)
+                                            targetPositions[pIdx*3] = p1x + (p2x-p1x)*t;
+                                            targetPositions[pIdx*3+1] = p1y + (p2y-p1y)*t;
+                                            targetPositions[pIdx*3+2] = p1z + (p2z-p1z)*t; // Z轴现在包含高度信息
+                                            pCount++;
+                                        }
+                                    }
+                                }
+                            } else {
+                                // 生命衰减 (速度更慢)
+                                life -= 0.001; 
+                                randoms[leaderIdx * 3] = life;
+                            }
+                        }
+                        
+                        // 读取最新生命值
+                        life = randoms[leaderIdx * 3];
+                        
+                        if (life > 0) {
+                            // 显示粒子
+                            const tx = targetPositions[i*3];
+                            const ty = targetPositions[i*3+1];
+                            const tz = targetPositions[i*3+2];
+                            
+                            // 改为插值移动，以便支持物理偏移
+                            currentPositions[i*3] += (tx - currentPositions[i*3]) * 0.2;
+                            currentPositions[i*3+1] += (ty - currentPositions[i*3+1]) * 0.2;
+                            
+                            // 基础高度(tz) + 浮动上升
+                            const targetZ = tz + (1.0 - life) * 150;
+                            currentPositions[i*3+2] += (targetZ - currentPositions[i*3+2]) * 0.2; 
+                            
+                            // 颜色淡入淡出
+                            let alpha = 1.0;
+                            if (life > 0.8) alpha = (1.0 - life) * 5;
+                            else if (life < 0.2) alpha = life * 5;
+                            
+                            const c = new THREE.Color().setHSL(0.12, 1.0, 0.6); // 金色
+                            currentColors[i*3] = c.r * alpha;
+                            currentColors[i*3+1] = c.g * alpha;
+                            currentColors[i*3+2] = c.b * alpha;
+                        } else {
+                            // 隐藏
+                            currentPositions[i*3] = 0;
+                            currentPositions[i*3+1] = 0;
+                            currentPositions[i*3+2] = -1000; // 移到视野外
+                        }
+                    }
+
+                    // --- 物理反馈 (Physics Interaction) ---
+                    // 计算粒子与光标的距离 (使用转换后的局部坐标 localCursor)
+                    const dx = currentPositions[i*3] - localCursor.x;
+                    const dy = currentPositions[i*3+1] - localCursor.y;
+                    const dz = currentPositions[i*3+2] - localCursor.z; // 引入高度差
+                    
+                    // 使用 3D 距离判断，确保只有在高度接近时才触发
+                    const distSq = dx*dx + dy*dy + dz*dz;
+                    const interactRadius = 60;
+                    
+                    if (distSq < interactRadius * interactRadius) {
+                        const dist = Math.sqrt(distSq);
+                        const force = (interactRadius - dist) / interactRadius; // 0(边缘) -> 1(中心)
+                        const angle = Math.atan2(dy, dx);
+                        const pushStrength = 20 * force; // 斥力强度
+                        
+                        currentPositions[i*3] += Math.cos(angle) * pushStrength;
+                        currentPositions[i*3+1] += Math.sin(angle) * pushStrength;
+                        // 稍微向上浮动，模拟能量扰动
+                        currentPositions[i*3+2] += force * 5;
+                    }
+                }
+            } else if (currentState === STATE_GATHERING) {
+                // 聚集动画
+                animationProgress += 0.01;
+                
+                // 螺旋向中心汇聚
+                for(let i=0; i<PARTICLE_COUNT; i++) {
+                     // Move towards (0,0,0)
+                     currentPositions[i*3] *= 0.95;
+                     currentPositions[i*3+1] *= 0.95;
+                     currentPositions[i*3+2] *= 0.95;
+                     
+                     // Color dark
+                     currentColors[i*3] *= 0.9;
+                     currentColors[i*3+1] *= 0.9;
+                     currentColors[i*3+2] *= 0.9;
+                }
+                
+                if (animationProgress > 1.0) {
+                    currentState = STATE_BLACK_HOLE;
+                    generateBlackHoleTargets();
+                    document.getElementById('status').innerText = "黑洞坍缩 - 按 'E' 释放超位魔法";
+                    document.getElementById('status').style.color = "#000000";
+                    document.getElementById('status').style.textShadow = "0 0 5px #ffffff";
+                }
+
+            } else if (currentState === STATE_BLACK_HOLE) {
+                // 黑洞状态
+                // 旋转
+                particleSystem.rotation.z += 0.005; // 整体缓慢旋转
+                
+                for (let i = 0; i < PARTICLE_COUNT; i++) {
+                    if (i < 35000) {
+                        // --- 吸积盘粒子 ---
+                        // 读取初始参数
+                        let theta = randoms[i * 3];
+                        let r = randoms[i * 3 + 1];
+                        const speedFactor = randoms[i * 3 + 2];
+                        
+                        // 1. 差速旋转 (Keplerian-like): 越近越快
+                        // v ~ 1/sqrt(r) -> omega ~ 1/r^1.5
+                        // 简化: omega = speed / r
+                        const omega = 20.0 / (r + 10); 
+                        theta += omega;
+                        
+                        // 2. 缓慢吸入
+                        r -= 0.2 * speedFactor;
+                        
+                        // 3. 事件视界重置
+                        if (r < 50) { // 进入视界
+                            r = 600; // 重置到外围
+                            // 重新随机角度
+                            theta = Math.random() * Math.PI * 2;
+                        }
+                        
+                        // 更新状态
+                        randoms[i * 3] = theta;
+                        randoms[i * 3 + 1] = r;
+                        
+                        // 计算新位置
+                        // 加上一点 Z 轴波动
+                        const z = currentPositions[i * 3 + 2]; 
+                        
+                        // 目标位置
+                        const tx = r * Math.cos(theta);
+                        const ty = r * Math.sin(theta);
+                        
+                        // 平滑移动
+                        currentPositions[i * 3] += (tx - currentPositions[i * 3]) * 0.5;
+                        currentPositions[i * 3 + 1] += (ty - currentPositions[i * 3 + 1]) * 0.5;
+                        currentPositions[i * 3 + 2] += (z - currentPositions[i * 3 + 2]) * 0.1; // 保持Z轴稳定
+                        
+                        // 颜色：根据半径渐变 (黑体辐射模拟)
+                        // r: 50(Hot) -> 600(Cool)
+                        const t = (r - 50) / 550; // 0 -> 1
+                        
+                        let cr, cg, cb;
+                        if (t < 0.1) { // 极热 (蓝白)
+                            cr=0.8; cg=0.9; cb=1.0;
+                        } else if (t < 0.3) { // 热 (橙)
+                            cr=1.0; cg=0.6; cb=0.1;
+                        } else if (t < 0.6) { // 温 (红)
+                            cr=0.8; cg=0.1; cb=0.0;
+                        } else { // 冷 (暗红/黑)
+                            cr=0.2; cg=0.0; cb=0.0;
+                        }
+                        
+                        // 随机闪烁
+                        const flicker = 0.8 + 0.2 * Math.random();
+                        currentColors[i * 3] = cr * flicker;
+                        currentColors[i * 3 + 1] = cg * flicker;
+                        currentColors[i * 3 + 2] = cb * flicker;
+                        
+                    } else {
+                        // --- 光晕/背景 (Halo) ---
+                        // 缓慢被吸入
+                        const tx = targetPositions[i * 3];
+                        const ty = targetPositions[i * 3 + 1];
+                        const tz = targetPositions[i * 3 + 2];
+                        
+                        currentPositions[i * 3] += (tx - currentPositions[i * 3]) * 0.02;
+                        currentPositions[i * 3 + 1] += (ty - currentPositions[i * 3 + 1]) * 0.02;
+                        currentPositions[i * 3 + 2] += (tz - currentPositions[i * 3 + 2]) * 0.02;
+                        
+                        // 颜色：暗淡
+                        currentColors[i * 3] = 0.1;
+                        currentColors[i * 3 + 1] = 0.1;
+                        currentColors[i * 3 + 2] = 0.1;
+                    }
+                }
+
+                // 漫游控制 (新增)
+                const moveSpeed = 0.5; 
+                const sinYaw = Math.sin(cameraYaw);
+                const cosYaw = Math.cos(cameraYaw);
+                
+                if (cursorKeys.ArrowUp) { cursorPos.x -= sinYaw * moveSpeed; cursorPos.y -= cosYaw * moveSpeed; }
+                if (cursorKeys.ArrowDown) { cursorPos.x += sinYaw * moveSpeed; cursorPos.y += cosYaw * moveSpeed; }
+                if (cursorKeys.ArrowLeft) { cursorPos.x -= cosYaw * moveSpeed; cursorPos.y += sinYaw * moveSpeed; }
+                if (cursorKeys.ArrowRight) { cursorPos.x += cosYaw * moveSpeed; cursorPos.y -= sinYaw * moveSpeed; }
+                if (cursorKeys.Space) cursorHeight += moveSpeed;
+                if (cursorKeys.AltLeft || cursorKeys.AltRight) cursorHeight -= moveSpeed;
+
+                const localCursor = new THREE.Vector3(cursorPos.x, cursorHeight, cursorPos.y);
+                if (cursorMesh) {
+                    cursorMesh.position.copy(localCursor);
+                    camera.position.x += (cursorPos.x - camera.position.x) * 0.2;
+                    camera.position.y += (cursorHeight + 20 - camera.position.y) * 0.2;
+                    camera.position.z += (cursorPos.y - camera.position.z) * 0.2;
+                    camera.rotation.order = 'YXZ';
+                    camera.rotation.y = cameraYaw;
+                    camera.rotation.x = cameraPitch;
+                }
+
+                // (已移除手势触发超位魔法逻辑，改为按 E 键)
+
+            } else if (currentState === STATE_SUPER_MAGIC) {
+                // 超位魔法状态 (类似 Ground Circle，但更华丽)
+                
+                // 1. 保持平躺
+                const targetTilt = -Math.PI / 2;
+                particleSystem.rotation.x += (targetTilt - particleSystem.rotation.x) * 0.05;
+                particleSystem.rotation.z -= 0.001; // 慢速旋转
+
+                // 2. 粒子移动
+                for (let i = 0; i < PARTICLE_COUNT; i++) {
+                    const tx = targetPositions[i * 3];
+                    const ty = targetPositions[i * 3 + 1];
+                    const tz = targetPositions[i * 3 + 2];
+                    
+                    // 移动
+                    currentPositions[i * 3] += (tx - currentPositions[i * 3]) * 0.05;
+                    currentPositions[i * 3 + 1] += (ty - currentPositions[i * 3 + 1]) * 0.05;
+                    currentPositions[i * 3 + 2] += (tz - currentPositions[i * 3 + 2]) * 0.05;
+
+                    // 颜色：青/蓝/白 (高亮)
+                    // 根据高度(z)渐变
+                    // z=0 (Base) -> Cyan
+                    // z>0 (Dome) -> Blue/White
+                    
+                    let r, g, b;
+                    if (i >= 35000) { // 调整为新的界限
+                        // 背景宇宙粒子 (保持原色或微调)
+                        // 简单复用 GroundCircle 的逻辑
+                        if (i >= 42000) { // 红球
+                             const pulse = 0.5 + 0.5 * Math.sin(time * 3 + i * 0.01);
+                             r=1.0*pulse; g=0.0; b=0.0;
+                        } else if (i >= 38000) { // 行星
+                             r=0.8; g=0.8; b=1.0;
+                        } else { // 星星
+                             const flicker = Math.random() > 0.95 ? 1.0 : 0.8;
+                             r=flicker; g=flicker; b=flicker;
+                        }
+                    } else {
+                        // 魔法阵粒子
+                        const h = currentPositions[i*3+2]; // 高度
+                        if (h < 10) { // Base
+                            // 符文环颜色 (金色)
+                            // 简单判断：半径在特定范围内
+                            const px = currentPositions[i*3];
+                            const py = currentPositions[i*3+1];
+                            const rad = Math.sqrt(px*px + py*py);
+                            
+                            // 粗略判断符文环位置 (0.95*600=570, 0.65*600=390)
+                            if ((rad > 560 && rad < 580) || (rad > 380 && rad < 400)) {
+                                r=1.0; g=0.8; b=0.2; // Gold
+                            } else {
+                                r=0.0; g=1.0; b=1.0; // Cyan
+                            }
+                        } else { // Dome
+                            r=0.2; g=0.5; b=1.0; // Blue
+                        }
+                        // 闪烁
+                        if (Math.random() > 0.9) { r=1.0; g=1.0; b=1.0; }
+                    }
+                    
+                    currentColors[i * 3] += (r - currentColors[i * 3]) * 0.1;
+                    currentColors[i * 3 + 1] += (g - currentColors[i * 3 + 1]) * 0.1;
+                    currentColors[i * 3 + 2] += (b - currentColors[i * 3 + 2]) * 0.1;
+                }
+                
+                // 3. 漫游控制 (复用)
+                // ... (为了简化代码，这里不再复制漫游逻辑，用户可以飞，但没有物理交互)
+                // 如果需要物理交互，可以把 GroundCircle 的逻辑提取出来。
+                // 鉴于代码长度，这里先让它"只看"，或者简单加上漫游移动
+                
+                const moveSpeed = 2.5; 
+                const sinYaw = Math.sin(cameraYaw);
+                const cosYaw = Math.cos(cameraYaw);
+                
+                if (cursorKeys.ArrowUp) { cursorPos.x -= sinYaw * moveSpeed; cursorPos.y -= cosYaw * moveSpeed; }
+                if (cursorKeys.ArrowDown) { cursorPos.x += sinYaw * moveSpeed; cursorPos.y += cosYaw * moveSpeed; }
+                if (cursorKeys.ArrowLeft) { cursorPos.x -= cosYaw * moveSpeed; cursorPos.y += sinYaw * moveSpeed; }
+                if (cursorKeys.ArrowRight) { cursorPos.x += cosYaw * moveSpeed; cursorPos.y -= sinYaw * moveSpeed; }
+                if (cursorKeys.Space) cursorHeight += moveSpeed;
+                if (cursorKeys.AltLeft || cursorKeys.AltRight) cursorHeight -= moveSpeed;
+
+                const localCursor = new THREE.Vector3(cursorPos.x, cursorHeight, cursorPos.y);
+                if (cursorMesh) {
+                    cursorMesh.position.copy(localCursor);
+                    camera.position.x += (cursorPos.x - camera.position.x) * 0.2;
+                    camera.position.y += (cursorHeight + 20 - camera.position.y) * 0.2;
+                    camera.position.z += (cursorPos.y - camera.position.z) * 0.2;
+                    camera.rotation.order = 'YXZ';
+                    camera.rotation.y = cameraYaw;
+                    camera.rotation.x = cameraPitch;
+                }
+
             }
 
             positionsAttr.needsUpdate = true;
@@ -735,8 +1752,46 @@
 
         // --- MediaPipe Hands ---
         const videoElement = document.getElementById('video-input');
+
+        // --- 手部可视化更新 ---
+        function updateHandVisuals(results) {
+            // 隐藏所有关节
+            handJointMeshs.forEach(m => m.visible = false);
+
+            if (!results.multiHandLandmarks || !camera) return;
+
+            // 计算投影平面的尺寸 (在 z=0 处)
+            // 简单估算：camera.position.z = 800
+            const dist = camera.position.z;
+            const vFOV = camera.fov * Math.PI / 180;
+            const visibleHeight = 2 * Math.tan(vFOV / 2) * dist;
+            const visibleWidth = visibleHeight * camera.aspect;
+
+            results.multiHandLandmarks.forEach((landmarks, handIndex) => {
+                if (handIndex > 1) return; // 最多显示2只手
+                const offset = handIndex * 21;
+                
+                for (let i = 0; i < 21; i++) {
+                    const lm = landmarks[i];
+                    const mesh = handJointMeshs[offset + i];
+                    mesh.visible = true;
+                    
+                    // 坐标映射
+                    // MediaPipe: x(0左-1右), y(0上-1下)
+                    // Three.js: x(左负右正), y(上正下负)
+                    // 镜像: x = 1 - lm.x
+                    const x = (1 - lm.x - 0.5) * visibleWidth;
+                    const y = (0.5 - lm.y) * visibleHeight;
+                    const z = -lm.z * 100; // 简单深度
+
+                    mesh.position.set(x, y, z);
+                }
+            });
+        }
         
         function onResults(results) {
+            updateHandVisuals(results); // 更新可视化
+
             if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
                 handDetected = true;
                 handLandmarks = results.multiHandLandmarks[0];
@@ -755,6 +1810,23 @@
                 const wrist = handLandmarks[0];
                 const indexTip = handLandmarks[8];
                 const thumbTip = handLandmarks[4];
+
+                // --- 手势检测：招手/下压 (Swipe Down) ---
+                // 逻辑：检测手腕垂直速度
+                const currentHandY = wrist.y;
+                const dy = currentHandY - prevHandY;
+                prevHandY = currentHandY;
+
+                // 仅在高级法阵状态下触发
+                if (currentState === STATE_COMPLEX_CIRCLE && handDetected && !twoHandsDetected) {
+                    // 如果手向下移动速度够快 (dy > 0.04) 且手掌张开 (pinchDistance > 0.1)
+                    if (dy > 0.04 && pinchDistance > 0.1) {
+                        currentState = STATE_GROUND_CIRCLE;
+                        generateUniverse(); // 生成宇宙环境
+                        document.getElementById('status').innerText = "领域展开 - 远古铭文降临";
+                        document.getElementById('status').style.color = "#ff00ff";
+                    }
+                }
 
                 // 更新交互变量
                 indexFingerX = 1 - indexTip.x; // 镜像反转
