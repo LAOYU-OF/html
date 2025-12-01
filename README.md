@@ -2,15 +2,15 @@
 
 这是一个基于 **Three.js** 和 **MediaPipe** 的 3D 互动网页项目。通过摄像头识别手势，你可以控制一个炫酷的 3D 魔法阵。
 
-## 🔮 在线演示 (Live Demo)
+##  在线演示 (Live Demo)
 
 **点击下方链接直接体验：**
 
-👉 **[启动魔法阵 (Launch Magic Hexagram)](https://laoyu-of.github.io/-/magic_hexagram.html)**
+ **[启动魔法阵 (Launch Magic Hexagram)](https://laoyu-of.github.io/html/magic_hexagram.html)**
 
 *(注意：首次打开可能需要允许摄像头权限，且加载模型需要几秒钟)*
 
-## 🎮 操作指南
+##  操作指南
 
 1.  **初始状态 (球体)**：
     *   **单指移动**：旋转球体。
@@ -25,6 +25,6 @@
     *   **双手距离**：控制法阵的展开与收缩。
     *   **持久化**：法阵生成后会保持存在，只有**双手合拢**时才会消失。
 
-## 🛠️ 技术栈
+##  技术栈
 - Three.js
 - MediaPipe Hands
